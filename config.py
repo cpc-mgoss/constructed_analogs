@@ -37,15 +37,13 @@ DATA_SOURCES = {
     "oi_operational": {
         "dir_path": Path("/cpc/GODAS/OISSTv2.1/DATA/month"),
         "template": "mnth.OISSTv2.1_1x1.{year:04d}{month:02d}.gr",
-        "nx": 360, 
-        "ny": 181,                          # Fixed: 181 lat lines
-        "lat_edges": (-90.0, 90.0),         # Fixed: Runs from -90 to 90
-        "lon_edges": (0.0, 359.0),          # Fixed: Runs from 0 to 359
+        "nx": 360, "ny": 181,
+        "lat_edges": (-90.0, 90.0), "lon_edges": (0.0, 359.0),
     }
 }
 
 # =====================================================================
-# 4. CLIMATE & EVALUATION GRID STANDARDS
+# 4. CLIMATE & SPECTRAL DOMAIN CONFIGURATIONS
 # =====================================================================
 CLIM_START_YR, CLIM_END_YR = 1991, 2020
 EOF_RANGE = "tp_ml"
@@ -58,6 +56,10 @@ TARGET_NX, TARGET_NY = 360, 180
 TARGET_LAT_EDGES = (-89.5, 89.5)
 TARGET_LON_EDGES = (0.5, 359.5)
 UNDEF_FLAGS = [-9.99e8, -999.0, -999000000.0]
+
+# High-Performance EOF Controls
+MAX_EOF_MODES = 40                 # The maximum spectrum limit to execute exactly ONCE
+EVAL_EOF_MODES = [15, 25, 40]       # The specific mode lengths requested for analog matching
 
 RUN_MODES = {
     "monthly": {"lag_months": 1, "apply_smoothing": False},
