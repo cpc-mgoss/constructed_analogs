@@ -1,0 +1,20 @@
+# Ignore the local conda environment binary tree
+env/
+
+# Ignore all data outputs and inputs (legacy or NetCDF)
+*.nc
+*.gr
+*.ctl
+data/
+season_fcst/
+
+# Ignore operational runtime logs and temporary scratch files
+0Logs/
+tmp/
+*.out
+*.log
+.DS_Store
+
+# Ignore Python cache artifacts
+__pycache__/
+*.pyc
