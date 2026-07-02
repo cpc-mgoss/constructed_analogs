@@ -2,96 +2,143 @@
 import numpy as np
 import xarray as xr
 import pandas as pd
-import sys
+import struct
 import config
-from utils import read_grads_binary, read_templated_grads_binary
 
-def load_and_regrid_sst(dataset_type, mode):
-    """Ingests central repository tracks and conforms them to the standard evaluation grid."""
-    mode_settings = config.RUN_MODES[mode]
-    
-    run_date = pd.to_datetime(f"{config.RUN_YR}-{config.RUN_MO:02d}-15")
-    target_date = run_date - pd.DateOffset(months=mode_settings["lag_months"])
-    
-    target_lat = np.linspace(config.TARGET_LAT_EDGES[0], config.TARGET_LAT_EDGES[1], config.TARGET_NY)
-    target_lon = np.linspace(config.TARGET_LON_EDGES[0], config.TARGET_LON_EDGES[1], config.TARGET_NX)
-    
-    if dataset_type == "ersst":
-        meta = config.DATA_SOURCES["ersst"]
-        print(f"[INGESTION]: Parsing ERSST master file through target horizon: {target_date.strftime('%Y-%m')}")
-        
-        full_da = read_grads_binary(
-            file_path=meta["binary_path"], nx=meta["nx"], ny=meta["ny"],
-            start_date_str=meta["archive_start_date"], lat_edges=meta["lat_edges"], lon_edges=meta["lon_edges"]
-        )
-        
-        if target_date not in full_da.time:
-            print(f"[DATA ERROR]: ERSST archive does not contain records reaching {target_date.strftime('%Y-%m')} yet.")
-            sys.exit(1)
-            
-        sliced_da = full_da.sel(time=slice("1948-02-15", target_date))
-        print("Vectorized Regridding: Linearly interpolating coarse ERSST matrix to 1x1 grid...")
-        return sliced_da.interp(lat=target_lat, lon=target_lon, method="linear")
-        
-    else:
-        print(f"[INGESTION]: Executing HadISST/OISST split merge engine through target horizon: {target_date.strftime('%Y-%m')}")
-        had_meta = config.DATA_SOURCES["had_historical"]
-        oi_meta = config.DATA_SOURCES["oi_operational"]
-        
-        # 1. HadISST Chunk: Already natively maps to the standard 360x180 target coordinates
-        had_full = read_grads_binary(
-            file_path=had_meta["binary_path"], nx=had_meta["nx"], ny=had_meta["ny"],
-            start_date_str=had_meta["archive_start_date"], lat_edges=had_meta["lat_edges"], lon_edges=had_meta["lon_edges"]
-        )
-        had_chunk = had_full.sel(time=slice("1948-01-01", "1981-08-31"))
-        
-        # 2. OISST Chunk: Ingest separate monthly files at their native 360x181 grid spacing
-        oi_dates = pd.date_range(start="1981-09-01", end=target_date, freq="MS") + pd.Timedelta(days=14)
-        print(f"[STITCHING]: Assembling {len(oi_dates)} templated OISST monthly files ({oi_meta['ny']}x{oi_meta['nx']}) into memory...")
-        
-        oi_raw = read_templated_grads_binary(
-            dir_path=oi_meta["dir_path"], template=oi_meta["template"],
-            nx=oi_meta["nx"], ny=oi_meta["ny"], date_axis=oi_dates,
-            lat_edges=oi_meta["lat_edges"], lon_edges=oi_meta["lon_edges"]
-        )
-        
-        # Replicate legacy math: add 273.16 constant to the data stream
-        oi_raw = oi_raw + 273.16
-        
-        # Regrid the OISST component to conform perfectly to the standard target matrix axes
-        print("Vectorized Alignment: Interpolating OISST grid from 181 to 180 latitude coordinates...")
-        oi_chunk = oi_raw.interp(lat=target_lat, lon=target_lon, method="linear")
-        
-        # Join the aligned data structures seamlessly across the timeline axis
-        return xr.concat([had_chunk, oi_chunk], dim="time")
+def run_ocean_predictor_pipeline(target_dataset, mode="seasonal"):
+    """
+    Ingests raw operational binaries, handles regridding, anomaly calculations,
+    and structures initial condition snapshots using the Month-Start (Day 1) standard.
+    """
+    print(f"\n====================================================")
+    print(f"[INGESTION]: Processing {target_dataset.upper()} ({mode.upper()} track)...")
+    print(f"====================================================")
 
-def process_anomalies(sst_da):
-    """Generates departures against the designated climate baseline window."""
-    base_window = sst_da.sel(time=slice(f"{config.CLIM_START_YR}-01-01", f"{config.CLIM_END_YR}-12-31"))
-    climatology = base_window.groupby("time.month").mean("time")
-    return (sst_da.groupby("time.month") - climatology).drop_vars("month")
+    base_run_date = pd.Timestamp(year=config.RUN_YR, month=config.RUN_MO, day=1)
+    lag_months = config.RUN_MODES[mode]["lag_months"]
+    apply_smoothing = config.RUN_MODES[mode]["apply_smoothing"]
 
-def run_ocean_predictor_pipeline(target_dataset, mode):
-    """Coordinates data extraction and generates sandboxed netCDF files."""
-    dtype = target_dataset
-    
-    sst_standardized = load_and_regrid_sst(dtype, mode)
-    anomalies = process_anomalies(sst_standardized)
-    
-    if config.RUN_MODES[mode]["apply_smoothing"]:
+    target_horizon = base_run_date - pd.DateOffset(months=1)
+    print(f"Target data ingestion horizon: {target_horizon.strftime('%Y-%m')}")
+
+    # 1. Parse Raw Binary Data Streams
+    if target_dataset == "ersst":
+        src = config.DATA_SOURCES["ersst"]
+        available_da = _parse_sequential_binary(
+            src["binary_path"], src["nx"], src["ny"], src["archive_start_date"],
+            src["lat_edges"], src["lon_edges"], target_horizon, src["dtype"], src["is_kelvin"]
+        )
+        monthly_sst = available_da.interp(lat=np.arange(-89.5, 90.5, 1.0), lon=np.arange(0.5, 360.5, 1.0), method="linear")
+
+    elif target_dataset == "hadoisst":
+        hist_src = config.DATA_SOURCES["had_historical"]
+        historical_da = _parse_sequential_binary(
+            hist_src["binary_path"], hist_src["nx"], hist_src["ny"], hist_src["archive_start_date"],
+            hist_src["lat_edges"], hist_src["lon_edges"], target_horizon, hist_src["dtype"], hist_src["is_kelvin"]
+        )
+
+        oper_da_list = []
+        start_oper_date = pd.Timestamp("2010-04-01")
+        oper_months = pd.date_range(start=start_oper_date, end=target_horizon, freq="MS")
+
+        for m in oper_months:
+            file_name = config.DATA_SOURCES["oi_operational"]["template"].format(year=m.year, month=m.month)
+            f_path = config.DATA_SOURCES["oi_operational"]["dir_path"] / file_name
+            src_oi = config.DATA_SOURCES["oi_operational"]
+            m_da = _parse_single_month_binary(
+                f_path, src_oi["nx"], src_oi["ny"], m,
+                src_oi["lat_edges"], src_oi["lon_edges"],
+                src_oi["dtype"], src_oi["is_kelvin"]
+            )
+            m_da = m_da.interp(lat=np.arange(-89.5, 89.5 + 1.0, 1.0), lon=np.arange(0.5, 360.5, 1.0), method="linear")
+            oper_da_list.append(m_da)
+
+        operational_da = xr.concat(oper_da_list, dim="time")
+        monthly_sst = xr.concat([historical_da.sel(time=slice(None, "2010-03-01")), operational_da], dim="time")
+
+    # 2. Handle Track-Specific Temporal Smoothing FIRST
+    if apply_smoothing:
         print("Computing centered 3-month rolling averages...")
-        processed_fields = anomalies.rolling(time=3, center=True, min_periods=3).mean()
+        processed_sst = monthly_sst.rolling(time=3, center=True).mean()
     else:
-        print("Preserving standard monthly steps (no rolling smoothing applied)...")
-        processed_fields = anomalies
+        processed_sst = monthly_sst
+
+    # 3. Enforce the Standardized Base Climatology Period (1991-2020)
+    clim_pool = processed_sst.sel(time=slice(f"{config.CLIM_START_YR}-01-01", f"{config.CLIM_END_YR}-12-31"))
+    climatology = clim_pool.groupby("time.month").mean(dim="time")
+    processed_anom = processed_sst.groupby("time.month") - climatology
+
+    # --> NEW: Export Climatology for Text Tables
+    out_clim_file = config.OUT_DATA_DIR / f"{target_dataset}.{mode}.climatology.nc"
+    climatology.to_netcdf(out_clim_file)
+    print(f"  -> Climatology saved to {out_clim_file.name}")
+
+    out_anom_file = config.OUT_DATA_DIR / f"{target_dataset}.{mode}.1948-curr.1x1.nc"
+    processed_anom.to_netcdf(out_anom_file)
+
+    # 4. Extract Initial Conditions
+    print("Extracting multi-scale Initial Condition snapshot coordinates...")
+    ic_snapshots = []
+
+    for tier_num, offset in zip(config.IC_NUMS, config.IC_OFFSETS):
+        ic_target_date = base_run_date - pd.DateOffset(months=int(lag_months)) - pd.DateOffset(months=int(offset))
+        print(f"  -> Compiling Tier [ic_num={tier_num}] Target Date: {ic_target_date.strftime('%Y-%m-%d')}")
+
+        ic_slice = processed_anom.sel(time=ic_target_date)
+        ic_slice = ic_slice.expand_dims(ic_num=[tier_num])
+        ic_snapshots.append(ic_slice)
+
+    ic_master_da = xr.concat(ic_snapshots, dim="ic_num")
+    out_ic_file = config.OUT_DATA_DIR / f"{target_dataset}.{mode}.msic.ic.nc"
+    ic_master_da.to_netcdf(out_ic_file)
+    print(f"SUCCESS: {target_dataset.upper()} ({mode.upper()}) pipeline files written to disk.\n")
+
+
+def _parse_sequential_binary(file_path, nx, ny, start_date_str, lat_edges, lon_edges, end_horizon, target_dtype, is_kelvin):
+    """Parses binary files into Xarray objects using clean Month-Start frequencies."""
+    bytes_per_record = nx * ny * 4
+    file_size = file_path.stat().st_size
+    total_months = file_size // bytes_per_record
     
-    print("Extracting 4-tier Initial Condition snapshot coordinates...")
-    ic_snapshots = [processed_fields.isel(time=-1 - offset) for offset in config.IC_OFFSETS]
-    ic_dataset = xr.concat(ic_snapshots[::-1], dim="ic_num").assign_coords(ic_num=config.IC_NUMS)
+    start_date = pd.Timestamp(start_date_str).replace(day=1)
+    time_axis = pd.date_range(start=start_date, periods=total_months, freq="MS")
     
-    master_out = config.OUT_DATA_DIR / f"{dtype}.{mode}.1948-curr.1x1.nc"
-    ic_out = config.OUT_DATA_DIR / f"{dtype}.{mode}.msic.ic.nc"
+    lat_axis = np.linspace(lat_edges[0], lat_edges[1], ny)
+    lon_axis = np.linspace(lon_edges[0], lon_edges[1], nx)
     
-    processed_fields.to_netcdf(master_out)
-    ic_dataset.to_netcdf(ic_out)
-    print(f"SUCCESS: {dtype.upper()} ({mode.upper()}) NetCDF files written out to development workspace.")
+    with open(file_path, "rb") as f:
+        raw_data = f.read()
+        
+    parsed_array = np.frombuffer(raw_data, dtype=target_dtype).reshape(total_months, ny, nx)
+    
+    # Apply Kelvin offset dynamically from config
+    if is_kelvin:
+        parsed_array = parsed_array - config.KELVIN_OFFSET
+    
+    invalid_mask = np.isin(parsed_array, config.UNDEF_FLAGS) | (parsed_array < config.VALID_SST_MIN) | (parsed_array > config.VALID_SST_MAX)
+    clean_array = np.where(invalid_mask, np.nan, parsed_array)
+    
+    da = xr.DataArray(clean_array, coords=[time_axis, lat_axis, lon_axis], dims=["time", "lat", "lon"], name="sst")
+    return da.sel(time=slice(None, end_horizon))
+
+def _parse_single_month_binary(file_path, nx, ny, current_timestamp, lat_edges, lon_edges, target_dtype, is_kelvin):
+    """Parses a single month binary file and forces a Month-Start coordinate stamp."""
+    with open(file_path, "rb") as f:
+        raw_data = f.read()
+        
+    parsed_grid = np.frombuffer(raw_data, dtype=target_dtype).reshape(ny, nx)
+    
+    # Apply Kelvin offset dynamically from config
+    if is_kelvin:
+        parsed_grid = parsed_grid - config.KELVIN_OFFSET
+        
+    invalid_mask = np.isin(parsed_grid, config.UNDEF_FLAGS) | (parsed_grid < config.VALID_SST_MIN) | (parsed_grid > config.VALID_SST_MAX)
+    clean_grid = np.where(invalid_mask, np.nan, parsed_grid)
+    
+    lat_axis = np.linspace(lat_edges[0], lat_edges[1], ny)
+    lon_axis = np.linspace(lon_edges[0], lon_edges[1], nx)
+    
+    clean_timestamp = pd.Timestamp(current_timestamp).replace(day=1)
+
+    da = xr.DataArray(clean_grid, coords=[lat_axis, lon_axis], dims=["lat", "lon"], name="sst")
+    return da.expand_dims(time=[clean_timestamp])
